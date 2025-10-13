@@ -1,133 +1,158 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Auto Token Generator (BD Push Fixed + Batch 200 Limit)
-"""
+import json
+import time
+import asyncio
+import httpx
+import subprocess
+import os
+import requests
+from typing import Dict, Optional
 
-import os, json, time, asyncio, httpx, subprocess, requests
-from typing import Dict, Any
-
-JWT_API_URL = "https://jwt-api-aditya-ffm.vercel.app/token"
-USERAGENT = "Dalvik/2.1.0 (Linux; Android 13; CPH2095 Build/RKQ1.211119.001)"
+# --- Settings ---
+RELEASEVERSION = "OB50"
+USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 TELEGRAM_TOKEN = "8468503201:AAEkTmfyFwuMM3BkiVR1WQIlJkdljS5KYHs"
 TELEGRAM_CHAT_ID = 6621572366
-BATCH_SIZE = 200
 BRANCH_NAME = "main"
+JWT_API_URL = "https://jwt-api-aditya-ffm.vercel.app/token"
 
-BLOCKED_FILE = "blocked_uids.json"
-PROCESSED_FILE = "processed_uids.json"
-
-
-def send_telegram(msg):
+# --- Telegram ---
+def send_telegram_message(message: str):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10,
-        )
-    except:
-        pass
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"Telegram send error: {e}")
 
-
-def git_push_replace(filename):
-    os.system('git config user.name "AutoBot"')
-    os.system('git config user.email "autobot@example.com"')
-    os.system(f"git checkout {BRANCH_NAME}")
-    os.system(f"git add {filename}")
-    os.system(f'git commit -m "Replace {filename}" || echo "no change"')
-    os.system(f"git push origin {BRANCH_NAME} || echo 'Push failed'")
-    send_telegram(f"✅ GitHub updated: {filename}")
-
-
-def load_json(file):
-    return json.load(open(file)) if os.path.exists(file) else {}
-
-
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-async def get_token(client, uid, pwd):
-    url = f"{JWT_API_URL}?uid={uid}&password={pwd}"
+# --- Git Helpers ---
+def run_git_command(cmd):
     try:
-        r = await client.get(url, headers={"User-Agent": USERAGENT}, timeout=25)
-        if r.status_code == 200:
-            j = r.json()
-            token = j.get("token") or j.get("jwt")
-            if token:
-                return {"ok": True, "token": token}
-        elif r.status_code in (401, 403):
-            return {"ok": False, "blocked": True}
-    except:
-        pass
-    return {"ok": False}
+        result = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, universal_newlines=True)
+        return result.strip()
+    except subprocess.CalledProcessError as e:
+        return e.output.strip()
 
+def detect_git_conflict():
+    status = run_git_command("git status")
+    return "both modified" in status or "Unmerged paths" in status
 
-async def handle_one(client, acc, blocked):
-    uid, pwd = acc["uid"], acc["password"]
-    if uid in blocked:
-        return {"uid": uid, "blocked": True}
+def resolve_git_conflict():
+    print("\n⚠️ Git Conflict Detected. Resolve manually then press Enter.")
+    input("➡️ Press Enter after resolving conflicts... ")
+    run_git_command("git add .")
+    run_git_command("git rebase --continue")
+    print("✅ Rebase continued.")
 
-    res = await get_token(client, uid, pwd)
-    if res.get("ok"):
-        print(f"✅ Token OK: {uid}")
-        return {"uid": uid, "token": res["token"]}
-    elif res.get("blocked"):
-        print(f"🚫 Blocked UID: {uid}")
-        return {"uid": uid, "blocked": True}
+def push_to_git():
+    run_git_command(f"git checkout {BRANCH_NAME}")
+    run_git_command(f"git add .")
+    run_git_command(f"git commit -m 'Auto token update'")
+    run_git_command(f"git push origin {BRANCH_NAME}")
+    print(f"🚀 Changes pushed to {BRANCH_NAME} branch.")
+
+def get_repo_and_filename(region):
+    if region == "IND":
+        return "token_ind.json"
+    elif region in {"BR", "US", "SAC", "NA"}:
+        return "token_br.json"
     else:
-        print(f"❌ Failed UID: {uid}")
-        return {"uid": uid}
+        return "token_bd.json"
 
+# --- Token Generation ---
+async def generate_jwt_token(client, uid: str, password: str) -> Optional[Dict]:
+    try:
+        url = f"{JWT_API_URL}?uid={uid}&password={password}"
+        headers = {'User-Agent': USERAGENT, 'Accept': 'application/json'}
+        resp = await client.get(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception as e:
+        print(f"Error generating token for {uid}: {e}")
+        return None
 
-async def generate_region(region: str):
+async def process_account_with_retry(client, index, uid, password, max_retries=2):
+    for attempt in range(max_retries):
+        token_data = await generate_jwt_token(client, uid, password)
+        if token_data and "token" in token_data:
+            return {
+                "serial": index + 1,
+                "uid": uid,
+                "password": password,
+                "token": token_data["token"],
+                "notiRegion": token_data.get("notiRegion", "")
+            }
+        if attempt < max_retries - 1:
+            print(f"⏳ UID #{index + 1} {uid} - Retry after 1 minute...")
+            await asyncio.sleep(60)
+    return {"serial": index + 1, "uid": uid, "password": password, "token": None, "notiRegion": ""}
+
+async def generate_tokens_for_region(region):
+    start_time = time.time()
     input_file = f"uid_{region}.json"
+
     if not os.path.exists(input_file):
-        send_telegram(f"⚠️ Missing file: {input_file}")
+        msg = f"⚠️ {input_file} not found. Skipping {region}..."
+        print(msg)
+        send_telegram_message(msg)
         return 0
 
-    data = json.load(open(input_file))
-    blocked = load_json(BLOCKED_FILE)
-    processed = load_json(PROCESSED_FILE)
-    tokens = []
-    total = len(data)
+    with open(input_file, "r") as f:
+        accounts = json.load(f)
+
+    total_accounts = len(accounts)
+    print(f"🚀 Starting Token Generation for {region} ({total_accounts} accounts)...\n")
+
+    region_tokens = []
+    failed_serials, failed_values = [], []
 
     async with httpx.AsyncClient() as client:
-        for i in range(0, total, BATCH_SIZE):
-            batch = data[i : i + BATCH_SIZE]
-            print(f"\n⚙️ {region}: Batch {i//BATCH_SIZE+1} ({len(batch)} UIDs)")
-            res = await asyncio.gather(*[handle_one(client, a, blocked) for a in batch])
+        tasks = [process_account_with_retry(client, i, acc["uid"], acc["password"]) for i, acc in enumerate(accounts)]
+        results = await asyncio.gather(*tasks)
 
-            new_tokens = []
-            for r in res:
-                uid = r["uid"]
-                if r.get("blocked"):
-                    blocked[uid] = True
-                    send_telegram(f"🚫 UID {uid} blocked permanently.")
-                elif r.get("token"):
-                    new_tokens.append({"uid": uid, "token": r["token"]})
-                    processed[uid] = True
+        for result in results:
+            serial, uid, token, token_region = result["serial"], result["uid"], result["token"], result.get("notiRegion", "")
+            if token and token_region == region:
+                region_tokens.append({"uid": uid, "token": token})
+                print(f"✅ UID #{serial} {uid} - Token OK [{region}]")
+            else:
+                failed_serials.append(serial)
+                failed_values.append(uid)
+                print(f"❌ UID #{serial} {uid} - Failed [{region}]")
 
-            tokens.extend(new_tokens)
-            save_json(f"token_{region.lower()}.json", tokens)
-            save_json(BLOCKED_FILE, blocked)
-            save_json(PROCESSED_FILE, processed)
+    output_file = get_repo_and_filename(region)
+    with open(output_file, "w") as f:
+        json.dump(region_tokens, f, indent=2)
 
-            send_telegram(f"✅ {region} batch done ({len(new_tokens)} tokens).")
+    total_time = time.time() - start_time
+    summary = (
+        f"✅ *{region} Token Generation Complete*\n\n"
+        f"🔹 *Total Tokens:* {len(region_tokens)}\n"
+        f"🔢 *Total Accounts:* {total_accounts}\n"
+        f"❌ *Failed UIDs:* {len(failed_serials)}\n"
+        f"🔸 *Failed Serials:* {', '.join(map(str, failed_serials)) or 'None'}\n"
+        f"🔸 *Failed UIDs:* {', '.join(map(str, failed_values)) or 'None'}\n"
+        f"⏱️ *Time Taken:* {int(total_time // 60)}m {int(total_time % 60)}s"
+    )
 
-            if region == "BD":
-                git_push_replace(f"token_{region.lower()}.json")
+    send_telegram_message(summary)
+    print(summary)
+    return len(region_tokens)
 
-            await asyncio.sleep(10)
-
-    send_telegram(f"🎯 {region} finished. Total: {len(tokens)} tokens.")
-    return len(tokens)
-
-
+# --- Main ---
 if __name__ == "__main__":
     regions = ["IND", "BD", "NA"]
-    total = 0
-    for r in regions:
-        total += asyncio.run(generate_region(r))
-    send_telegram(f"🏁 All Done. Total Tokens: {total}")
+    total_tokens = 0
+
+    for region in regions:
+        send_telegram_message(f"🤖 {region} Token Generation Started...⚙️")
+        tokens_generated = asyncio.run(generate_tokens_for_region(region))
+        total_tokens += tokens_generated
+
+    send_telegram_message(f"🤖 All Regions Completed!\nTotal Tokens Generated: {total_tokens}")
+
+    if detect_git_conflict():
+        resolve_git_conflict()
+
+    push_to_git()
